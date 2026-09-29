@@ -1,0 +1,179 @@
+{
+  "name": "Example: call the Instagram Reels Publisher",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "eedfcb66-9d30-4152-a86c-780b449a1022",
+      "name": "Run Example",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"sample_video_url\": \"https://your-site.example.com/videos/sample-reel.mp4\",\n  \"caption\": \"This week on the menu: Grilled Chicken Wrap and Lemon Tart.\\n\\n#foodie #lunch\",\n  \"also_story\": true\n}",
+        "options": {}
+      },
+      "id": "42a154ee-73fe-4219-85fe-c5e868667573",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.sample_video_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 300000
+        }
+      },
+      "id": "064fe7da-3083-4afa-a7a5-5a85cc4ab92a",
+      "name": "Download Sample Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1db2218e-6ed6-4376-94fc-d3efbdc4d9de",
+              "name": "caption",
+              "value": "={{ $('Config').first().json.caption }}",
+              "type": "string"
+            },
+            {
+              "id": "ebe2ee8a-8028-450c-9f61-73adc71cf2f7",
+              "name": "share_to_feed",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "092dc143-9770-4334-ae0c-7d9ca6cd2791",
+              "name": "also_story",
+              "value": "={{ $('Config').first().json.also_story }}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {
+          "stripBinary": false
+        }
+      },
+      "id": "a9a8e29b-9d5c-4fc7-9987-b43d5f3586b7",
+      "name": "Add Publish Options",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "b81689c3-3ecb-4995-b5f2-2c608ed97ef4",
+      "name": "Publish via Reels Publisher",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Example caller\n1. Import **instagram-reels-publisher.json** first, set it up and publish it.\n2. In **Config** put a direct link to a vertical MP4 (9:16, 3 s - 15 min).\n3. In **Publish via Reels Publisher** pick the publisher workflow from the list.\n4. Run. The binary property `data` plus `caption` / `share_to_feed` / `also_story` are passed as-is (the publisher accepts all data). Output: `{ media_id, permalink, timestamp, story }`.\n\n**Add Publish Options** keeps the binary (`Strip Binary Data` = off). To publish several videos, put a *Loop Over Items* node before the call: one execution publishes one reel.",
+        "height": 300,
+        "width": 1100,
+        "color": 4
+      },
+      "id": "b6c1c9ee-72df-49d7-a5a9-0003e94f9f68",
+      "name": "Note: Example",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -40
+      ]
+    }
+  ],
+  "connections": {
+    "Run Example": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Download Sample Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Sample Video": {
+      "main": [
+        [
+          {
+            "node": "Add Publish Options",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Publish Options": {
+      "main": [
+        [
+          {
+            "node": "Publish via Reels Publisher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  }
+}

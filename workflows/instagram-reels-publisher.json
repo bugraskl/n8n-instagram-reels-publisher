@@ -1,0 +1,1206 @@
+{
+  "name": "Instagram Reels Publisher (resumable upload)",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "cb064500-938f-41a7-be22-d85b573199d6",
+      "name": "When Called by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        180
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "a18d7685-85ae-40ee-b873-4f18233e1c4c",
+      "name": "Manual Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        20,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"video_url\": \"https://your-site.example.com/videos/sample-reel.mp4\",\n  \"caption\": \"Fresh out of the oven: our Margherita Pizza.\\n\\n#pizza #margherita #foodie\",\n  \"share_to_feed\": true,\n  \"also_story\": false\n}",
+        "options": {}
+      },
+      "id": "1e5cdf5d-8833-4fe6-a31a-0f77b0bc4170",
+      "name": "Test Input",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"ig_user_id\": \"YOUR_IG_USER_ID\",\n  \"graph_version\": \"v23.0\",\n  \"poll_interval_seconds\": 60,\n  \"max_poll_attempts\": 6,\n  \"story_max_poll_attempts\": 3,\n  \"http_timeout_ms\": 300000,\n  \"max_reel_mb\": 300,\n  \"max_story_mb\": 100,\n  \"allowed_video_dir\": \"/data/downloads\"\n}",
+        "options": {}
+      },
+      "id": "722f5bac-d239-4626-a6f7-dbaacc114a0e",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the incoming request into ONE item that carries the video as binary \"video\"\n// (or a URL for the next node to download). Only the first input item is used:\n// one execution publishes one reel.\nconst cfg = $('Config').first().json;\n\nif (!/^\\d+$/.test(String(cfg.ig_user_id || ''))) {\n  throw new Error('Config.ig_user_id is not set. Put the numeric ID of your Instagram professional account into the Config node.');\n}\nif (!/^v\\d+\\.\\d+$/.test(String(cfg.graph_version || ''))) {\n  throw new Error('Config.graph_version must look like \"v23.0\".');\n}\n\n// Manual test run or a call from another workflow?\nconst src = $('Test Input').isExecuted\n  ? $('Test Input').first()\n  : $('When Called by Another Workflow').first();\nconst input = src.json || {};\nconst binaries = src.binary || {};\n\nconst toBool = (v, dflt) => {\n  if (v === undefined || v === null || v === '') return dflt;\n  if (typeof v === 'boolean') return v;\n  return !['false', '0', 'no', 'off'].includes(String(v).trim().toLowerCase());\n};\n\n// Caption limits from Meta's IG User Media reference: 2200 chars, 30 hashtags, 20 @tags.\nconst caption = input.caption == null ? '' : String(input.caption);\nif (caption.length > 2200) throw new Error(`Caption is ${caption.length} characters; Instagram allows at most 2200.`);\nconst hashtags = (caption.match(/(^|\\s)#[^\\s#]+/g) || []).length;\nif (hashtags > 30) throw new Error(`Caption has ${hashtags} hashtags; Instagram allows at most 30.`);\nconst mentions = (caption.match(/(^|\\s)@[A-Za-z0-9._]+/g) || []).length;\nif (mentions > 20) throw new Error(`Caption has ${mentions} @mentions; Instagram allows at most 20.`);\n\n// Optional cover. Meta downloads cover_url itself, so it must be publicly reachable.\nconst cover_url = input.cover_url ? String(input.cover_url).trim() : '';\nif (cover_url && !/^https?:\\/\\//i.test(cover_url)) throw new Error('cover_url must be a public http(s) URL.');\nlet thumb_offset = null;\nif (input.thumb_offset !== undefined && input.thumb_offset !== null && input.thumb_offset !== '') {\n  thumb_offset = Number(input.thumb_offset);\n  if (!Number.isInteger(thumb_offset) || thumb_offset < 0) throw new Error('thumb_offset must be a whole number of milliseconds (0 or more).');\n}\n\nconst options = {\n  caption,\n  share_to_feed: toBool(input.share_to_feed, true),\n  also_story: toBool(input.also_story, false),\n  cover_url: cover_url || null,\n  thumb_offset,\n};\n\n// (a) Binary video on the incoming item.\nconst keys = Object.keys(binaries);\nlet binKey = null;\nif (input.binary_property) {\n  binKey = String(input.binary_property);\n  if (!binaries[binKey]) throw new Error(`binary_property \"${binKey}\" not found on the input item. Available: ${keys.join(', ') || 'none'}.`);\n} else if (binaries.video) binKey = 'video';\nelse if (binaries.data) binKey = 'data';\nelse if (keys.length === 1) binKey = keys[0];\nelse if (keys.length > 1) throw new Error(`The input item has several binary properties (${keys.join(', ')}). Set binary_property to the one that holds the video.`);\n\nif (binKey) {\n  return [{ json: { ...options, source: 'binary', needs_download: false }, binary: { video: binaries[binKey] } }];\n}\n\n// (b) A URL. n8n downloads it in the next node; Meta never sees this URL.\nif (input.video_url) {\n  const u = String(input.video_url).trim();\n  if (!/^https?:\\/\\//i.test(u)) throw new Error('video_url must start with http:// or https://');\n  return [{ json: { ...options, source: 'url', needs_download: true, download_url: u } }];\n}\n\n// (c) A file on the n8n host. Needs NODE_FUNCTION_ALLOW_BUILTIN=fs.\nif (input.video_path) {\n  const p = String(input.video_path);\n  const root = String(cfg.allowed_video_dir || '').replace(/\\/+$/, '');\n  if (!root) throw new Error('Config.allowed_video_dir is empty; set it to the folder video_path may read from.');\n  if (!p.startsWith(root + '/') || p.split('/').includes('..')) {\n    throw new Error(`video_path must be inside ${root}/ (Config.allowed_video_dir).`);\n  }\n  let fs;\n  try { fs = require('fs'); } catch (e) {\n    throw new Error('video_path needs the fs module: set NODE_FUNCTION_ALLOW_BUILTIN=fs (on the task runner if you use external runners), or pass the video as binary / video_url.');\n  }\n  if (!fs.existsSync(p)) throw new Error(`video_path not found: ${p}`);\n  const name = p.split('/').pop();\n  const mime = /\\.mov$/i.test(name) ? 'video/quicktime' : 'video/mp4';\n  const bin = await this.helpers.prepareBinaryData(fs.readFileSync(p), name, mime);\n  return [{ json: { ...options, source: 'path', needs_download: false }, binary: { video: bin } }];\n}\n\nthrow new Error('No video given. Pass a binary video, video_url or video_path (see README).');\n"
+      },
+      "id": "0b395373-131d-4713-9f25-412c32417792",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "9fd0af74-4789-4c10-981d-ad8343325f92",
+              "leftValue": "={{ $json.needs_download }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "85c755d5-ec4e-4fa0-83a3-ccc896280925",
+      "name": "Needs Download?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.download_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "video"
+            }
+          },
+          "timeout": "={{ $('Config').first().json.http_timeout_ms }}"
+        }
+      },
+      "id": "c78615b6-4676-45c7-8325-bc711ea18c4d",
+      "name": "Download Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        1120,
+        180
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Measure the file, apply Meta's documented size limits and build the Reels container parameters.\nconst cfg = $('Config').first().json;\nconst p = $('Normalize Input').first().json;\nconst item = $input.first();\nconst bin = item.binary && item.binary.video;\nif (!bin) throw new Error('No \"video\" binary to upload (the download returned nothing?).');\n\n// rupload needs the exact byte count in the file_size header.\nlet bytes = Number(bin.bytes);\nif (!Number.isFinite(bytes) || bytes <= 0) {\n  const buf = await this.helpers.getBinaryDataBuffer(0, 'video');\n  bytes = buf.length;\n}\nif (!bytes) throw new Error('The video file is empty (0 bytes).');\n\nconst MB = 1000 * 1000;\nconst reelMax = Number(cfg.max_reel_mb) || 300;\nif (bytes > reelMax * MB) throw new Error(`Video is ${(bytes / MB).toFixed(1)} MB; the Reels limit is ${reelMax} MB.`);\n\nlet story_skipped = null;\nconst storyMax = Number(cfg.max_story_mb) || 100;\nif (p.also_story && bytes > storyMax * MB) {\n  story_skipped = `video is ${(bytes / MB).toFixed(1)} MB, above the ${storyMax} MB story limit`;\n}\n\n// Downloads sometimes come back as application/octet-stream; send a video content type.\nconst video = { ...bin };\nif (!/^video\\//.test(String(video.mimeType || ''))) {\n  video.mimeType = /\\.mov$/i.test(String(video.fileName || '')) ? 'video/quicktime' : 'video/mp4';\n}\n\n// Optional container parameters. If both are given Meta uses cover_url and ignores thumb_offset.\nconst extra_params = {};\nif (p.caption) extra_params.caption = p.caption;\nif (p.cover_url) extra_params.cover_url = p.cover_url;\nelse if (p.thumb_offset !== null && p.thumb_offset !== undefined) extra_params.thumb_offset = String(p.thumb_offset);\n\nreturn [{\n  json: {\n    share_to_feed: p.share_to_feed ? 'true' : 'false',\n    extra_params,\n    also_story: Boolean(p.also_story) && !story_skipped,\n    story_skipped,\n    bytes,\n    file_name: video.fileName || null,\n  },\n  binary: { video },\n}];\n"
+      },
+      "id": "b78bfdb1-e643-4db4-9226-4220f0bae105",
+      "name": "Prepare Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "httpRequestMethod": "POST",
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $('Config').first().json.ig_user_id }}",
+        "edge": "media",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "media_type",
+                "value": "REELS"
+              },
+              {
+                "name": "upload_type",
+                "value": "resumable"
+              },
+              {
+                "name": "share_to_feed",
+                "value": "={{ $json.share_to_feed }}"
+              }
+            ]
+          },
+          "queryParametersJson": "={{ JSON.stringify($json.extra_params) }}"
+        }
+      },
+      "id": "174d8755-97dd-4bfe-b974-3349d463e6bf",
+      "name": "Create Reel Container",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        300
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// A resumable container answers with { id, uri }. The bytes go to `uri` (rupload.facebook.com),\n// so Meta never has to download anything from your server.\nconst c = $input.first().json || {};\nif (!c.id || !c.uri) {\n  throw new Error('Meta did not return an upload URI for the reel container: ' + JSON.stringify(c).slice(0, 300));\n}\nconst prep = $('Prepare Upload').first();\nreturn [{\n  json: { container_id: String(c.id), uri: c.uri, bytes: prep.json.bytes },\n  binary: { video: prep.binary.video },\n}];\n"
+      },
+      "id": "e6ad6fb1-8ca1-4b6a-a3f6-551c555b70fb",
+      "name": "Attach Reel Video",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.uri }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "0"
+            },
+            {
+              "name": "file_size",
+              "value": "={{ $json.bytes }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "video",
+        "options": {
+          "timeout": "={{ $('Config').first().json.http_timeout_ms }}"
+        }
+      },
+      "id": "2088dad7-6db4-4590-bd76-537ba6d4b9c6",
+      "name": "Upload Reel Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2000,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Config').first().json.poll_interval_seconds }}",
+        "unit": "seconds"
+      },
+      "id": "2ab902ae-1267-4700-850d-78248770d2a2",
+      "name": "Wait for Reel Processing",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2220,
+        300
+      ],
+      "webhookId": "b2e41b00-24ea-4016-91b8-940f20fb11e7"
+    },
+    {
+      "parameters": {
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $('Create Reel Container').first().json.id }}",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "fields",
+                "value": "status_code,status"
+              }
+            ]
+          }
+        }
+      },
+      "id": "241865aa-ec05-4b40-bb80-3d36d235504b",
+      "name": "Get Reel Status",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        2440,
+        300
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// One status poll -> finished | pending | failed | timeout.\nconst cfg = $('Config').first().json;\nconst s = $input.first().json || {};\nconst containerId = String($('Create Reel Container').first().json.id);\nconst attempt = $runIndex + 1;\nconst max = Math.max(1, Number(cfg.max_poll_attempts) || 6);\nconst waited = attempt * (Number(cfg.poll_interval_seconds) || 60);\n\nlet state = 'pending';\nlet message = '';\nif (s.status_code === 'FINISHED') {\n  state = 'finished';\n} else if (s.status_code === 'ERROR' || s.status_code === 'EXPIRED') {\n  // For ERROR, Meta puts the error subcode into `status`.\n  state = 'failed';\n  message = `Meta could not process the reel video: status_code=${s.status_code}` +\n    (s.status ? `, status=${s.status}` : '') + ` (container ${containerId}).`;\n} else if (attempt >= max) {\n  state = 'timeout';\n  message = `Reel container ${containerId} is still ${s.status_code || 'not ready'} after ${attempt} checks (~${waited}s). ` +\n    'It can still be published with media_publish until it expires (24 h); raise max_poll_attempts if this happens often.';\n}\nreturn [{ json: { state, status_code: s.status_code || null, status: s.status || null, attempt, container_id: containerId, message } }];\n"
+      },
+      "id": "9ca86704-4800-4f78-8e61-91d3b15b9306",
+      "name": "Evaluate Reel Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "84e95670-0754-46ff-b0ea-93fd5ac1de08",
+                    "leftValue": "={{ $json.state }}",
+                    "rightValue": "finished",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "finished"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8dd9809b-7cce-4ed2-8f3f-2eb98b607d74",
+                    "leftValue": "={{ $json.state }}",
+                    "rightValue": "pending",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pending"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "failed / timeout"
+        }
+      },
+      "id": "53d73a09-8c4e-4f7a-ae77-6915c6e3a410",
+      "name": "Reel Status Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "errorMessage": "={{ $json.message }}"
+      },
+      "id": "d7bdb2aa-fedb-400c-9ad5-ca92265ea965",
+      "name": "Reel Failed",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        3100,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "httpRequestMethod": "POST",
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $('Config').first().json.ig_user_id }}",
+        "edge": "media_publish",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "creation_id",
+                "value": "={{ $('Create Reel Container').first().json.id }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "753312bd-58b8-46b4-84db-6abff02cb878",
+      "name": "Publish Reel",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        3100,
+        180
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $json.id }}",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "fields",
+                "value": "permalink,timestamp"
+              }
+            ]
+          }
+        }
+      },
+      "id": "f5bb65ea-81d8-4efa-b7ba-6542a1312792",
+      "name": "Get Permalink",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        3320,
+        180
+      ],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The reel is live. Collect its id and link; the permalink lookup is allowed to fail.\nconst prep = $('Prepare Upload').first().json;\nconst pub = $('Publish Reel').first().json || {};\nconst media_id = pub.id != null ? String(pub.id) : '';\nif (!media_id) throw new Error('media_publish did not return a media id: ' + JSON.stringify(pub).slice(0, 300));\nconst link = $input.first().json || {};\nreturn [{\n  json: {\n    media_id,\n    permalink: link.permalink || null,\n    timestamp: link.timestamp || null,\n    also_story: prep.also_story,\n    story_skipped: prep.story_skipped || null,\n  },\n}];\n"
+      },
+      "id": "e530b034-7d69-4746-a326-162a9b5d7f68",
+      "name": "Reel Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "229c96ea-f1f8-4549-85fa-388c5872bb14",
+              "leftValue": "={{ $json.also_story }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "736cbb07-658f-4817-bcc5-1fefa4134550",
+      "name": "Also Story?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3760,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "httpRequestMethod": "POST",
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $('Config').first().json.ig_user_id }}",
+        "edge": "media",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "media_type",
+                "value": "STORIES"
+              },
+              {
+                "name": "upload_type",
+                "value": "resumable"
+              }
+            ]
+          }
+        }
+      },
+      "id": "cfa5d70e-c42b-478d-b262-d82e6087db73",
+      "name": "Create Story Container",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        820
+      ],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Same file, second container (media_type=STORIES). Nothing in the story branch may fail the run:\n// problems are passed on and reported in story.error.\n// Readable reason from a failed item. Depending on the n8n version and node, the error sits on\n// item.error or in json.error / json (older Graph node). Meta's response body is recovered from\n// n8n's \"<status> - <body>\" text when possible.\nconst errText = (it) => {\n  const j = (it && it.json) || {};\n  const e = (it && it.error) || (j.error && typeof j.error === 'object' ? j.error : null);\n  let body = null;\n  for (const t of [e && e.cause && e.cause.message, e && e.description]) {\n    const m = typeof t === 'string' && t.match(/^\\d{3} - ([\\s\\S]+)$/);\n    if (!m) continue;\n    try {\n      body = JSON.parse(m[1]);\n      if (typeof body === 'string') body = JSON.parse(body);\n    } catch (x) { body = null; }\n    if (body && typeof body === 'object') break;\n    body = null;\n  }\n  const g = (body && (body.error || body.debug_info)) ||\n    (j.message && (j.code || j.error_subcode || j.type) ? j : null);\n  if (g && g.message) {\n    return g.message + (g.error_user_msg ? ' - ' + g.error_user_msg : '') +\n      (g.code ? ` (code ${g.code}${g.error_subcode ? ', subcode ' + g.error_subcode : ''})` : '');\n  }\n  if (e && (e.description || e.message)) return String(e.description || e.message);\n  if (typeof j.error === 'string') return j.error;\n  if (j.message) return String(j.message);\n  return JSON.stringify(j).slice(0, 300);\n};\nconst it = $input.first();\nconst c = it.json || {};\nif (!c.id || !c.uri || it.error) {\n  return [{ json: { story_error: 'story container could not be created: ' + errText(it) } }];\n}\nconst prep = $('Prepare Upload').first();\nreturn [{\n  json: { container_id: String(c.id), uri: c.uri, bytes: prep.json.bytes },\n  binary: { video: prep.binary.video },\n}];\n"
+      },
+      "id": "5e88c6f9-5bf7-4b63-b06c-b525c148acbc",
+      "name": "Attach Story Video",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        820
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cb54d93f-f910-4f75-b5ed-7e97b155bd5e",
+              "leftValue": "={{ !!$json.uri }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "03817d31-a05e-41f3-8c59-8ce9b84a9adf",
+      "name": "Story Container OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.uri }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "0"
+            },
+            {
+              "name": "file_size",
+              "value": "={{ $json.bytes }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "video",
+        "options": {
+          "timeout": "={{ $('Config').first().json.http_timeout_ms }}"
+        }
+      },
+      "id": "9ae7fe64-f307-4ad0-8c21-0f0de4a94d23",
+      "name": "Upload Story Video",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2220,
+        720
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Config').first().json.poll_interval_seconds }}",
+        "unit": "seconds"
+      },
+      "id": "4c17196e-e6c1-4090-8080-ad6107ba59c6",
+      "name": "Wait for Story Processing",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2440,
+        720
+      ],
+      "webhookId": "2fb81fe3-f6db-45ff-af37-87003ff242f3"
+    },
+    {
+      "parameters": {
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $('Create Story Container').first().json.id }}",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "fields",
+                "value": "status_code,status"
+              }
+            ]
+          }
+        }
+      },
+      "id": "7caad334-7113-41ed-b0a6-f0f8fa9a5a42",
+      "name": "Get Story Status",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        2660,
+        720
+      ],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// One story status poll -> finished | pending | failed | timeout (never throws).\n// Readable reason from a failed item. Depending on the n8n version and node, the error sits on\n// item.error or in json.error / json (older Graph node). Meta's response body is recovered from\n// n8n's \"<status> - <body>\" text when possible.\nconst errText = (it) => {\n  const j = (it && it.json) || {};\n  const e = (it && it.error) || (j.error && typeof j.error === 'object' ? j.error : null);\n  let body = null;\n  for (const t of [e && e.cause && e.cause.message, e && e.description]) {\n    const m = typeof t === 'string' && t.match(/^\\d{3} - ([\\s\\S]+)$/);\n    if (!m) continue;\n    try {\n      body = JSON.parse(m[1]);\n      if (typeof body === 'string') body = JSON.parse(body);\n    } catch (x) { body = null; }\n    if (body && typeof body === 'object') break;\n    body = null;\n  }\n  const g = (body && (body.error || body.debug_info)) ||\n    (j.message && (j.code || j.error_subcode || j.type) ? j : null);\n  if (g && g.message) {\n    return g.message + (g.error_user_msg ? ' - ' + g.error_user_msg : '') +\n      (g.code ? ` (code ${g.code}${g.error_subcode ? ', subcode ' + g.error_subcode : ''})` : '');\n  }\n  if (e && (e.description || e.message)) return String(e.description || e.message);\n  if (typeof j.error === 'string') return j.error;\n  if (j.message) return String(j.message);\n  return JSON.stringify(j).slice(0, 300);\n};\nconst cfg = $('Config').first().json;\nconst it = $input.first();\nconst s = it.json || {};\nconst attempt = $runIndex + 1;\nconst max = Math.max(1, Number(cfg.story_max_poll_attempts) || 3);\n\nlet state = 'pending';\nlet message = '';\nif (s.status_code === 'FINISHED') {\n  state = 'finished';\n} else if (s.status_code === 'ERROR' || s.status_code === 'EXPIRED') {\n  state = 'failed';\n  message = `Meta could not process the story video: status_code=${s.status_code}` + (s.status ? `, status=${s.status}` : '');\n} else if (!s.status_code && (it.error || s.message || s.error)) {\n  state = 'failed';\n  message = 'could not read the story container status: ' + errText(it).slice(0, 300);\n} else if (attempt >= max) {\n  state = 'timeout';\n  message = `story container still ${s.status_code || 'not ready'} after ${attempt} checks`;\n}\nreturn [{ json: { state, status_code: s.status_code || null, status: s.status || null, attempt, message } }];\n"
+      },
+      "id": "e3d86c38-88c4-464a-9082-1d4c012d6a59",
+      "name": "Evaluate Story Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "6fcf5519-e62c-4e58-b558-5215a76034cd",
+                    "leftValue": "={{ $json.state }}",
+                    "rightValue": "finished",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "finished"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "a881facc-924b-4d8c-9df4-7f1c3f3aacde",
+                    "leftValue": "={{ $json.state }}",
+                    "rightValue": "pending",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "pending"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "failed / timeout"
+        }
+      },
+      "id": "498e6ebe-0ea9-4ed8-bb97-09c2f1279620",
+      "name": "Story Status Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3100,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "httpRequestMethod": "POST",
+        "graphApiVersion": "={{ $('Config').first().json.graph_version }}",
+        "node": "={{ $('Config').first().json.ig_user_id }}",
+        "edge": "media_publish",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "creation_id",
+                "value": "={{ $('Create Story Container').first().json.id }}"
+              }
+            ]
+          }
+        }
+      },
+      "id": "ddb9f62d-2bee-4476-886d-b2c0a1bd2d8c",
+      "name": "Publish Story",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        3320,
+        620
+      ],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reached from every story exit (published, container/upload/status error, timeout).\n// Readable reason from a failed item. Depending on the n8n version and node, the error sits on\n// item.error or in json.error / json (older Graph node). Meta's response body is recovered from\n// n8n's \"<status> - <body>\" text when possible.\nconst errText = (it) => {\n  const j = (it && it.json) || {};\n  const e = (it && it.error) || (j.error && typeof j.error === 'object' ? j.error : null);\n  let body = null;\n  for (const t of [e && e.cause && e.cause.message, e && e.description]) {\n    const m = typeof t === 'string' && t.match(/^\\d{3} - ([\\s\\S]+)$/);\n    if (!m) continue;\n    try {\n      body = JSON.parse(m[1]);\n      if (typeof body === 'string') body = JSON.parse(body);\n    } catch (x) { body = null; }\n    if (body && typeof body === 'object') break;\n    body = null;\n  }\n  const g = (body && (body.error || body.debug_info)) ||\n    (j.message && (j.code || j.error_subcode || j.type) ? j : null);\n  if (g && g.message) {\n    return g.message + (g.error_user_msg ? ' - ' + g.error_user_msg : '') +\n      (g.code ? ` (code ${g.code}${g.error_subcode ? ', subcode ' + g.error_subcode : ''})` : '');\n  }\n  if (e && (e.description || e.message)) return String(e.description || e.message);\n  if (typeof j.error === 'string') return j.error;\n  if (j.message) return String(j.message);\n  return JSON.stringify(j).slice(0, 300);\n};\nconst it = $input.first();\nconst j = it.json || {};\nconst published = j.id != null && !it.error && !j.error && !j.message && !j.story_error && !j.state;\nlet story;\nif (published) {\n  story = { ok: true, media_id: String(j.id) };\n} else {\n  // story_error: container step; state/message: status loop; anything else: failed upload or publish call\n  const why = j.story_error || (j.state ? j.message : '') || errText(it);\n  story = { ok: false, error: String(why || 'unknown error').slice(0, 500) };\n}\nreturn [{ json: { story } }];\n"
+      },
+      "id": "9493a0c5-4650-489d-b166-89d1bd4b2f0e",
+      "name": "Story Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3540,
+        820
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Final result returned to the calling workflow (last node = sub-workflow output).\nconst reel = $('Reel Result').first().json;\nlet story = null; // null = not requested\nif ($('Story Result').isExecuted) story = $('Story Result').first().json.story;\nelse if (reel.story_skipped) story = { ok: false, error: reel.story_skipped };\nreturn [{ json: { media_id: reel.media_id, permalink: reel.permalink, timestamp: reel.timestamp, story } }];\n"
+      },
+      "id": "27a33532-0b3b-4d26-a18d-2233a25164f8",
+      "name": "Build Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3980,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Instagram Reels Publisher (resumable upload)\nPublishes a video as a **Reel** (and optionally the same file as a **Story**) without Meta having to download it from your server.\n\n**Setup**\n1. Create a **Facebook Graph API** credential (access token with `instagram_basic`, `instagram_content_publish`, `pages_read_engagement`).\n2. Select it on every Facebook Graph API node **and** on *Upload Reel Video* / *Upload Story Video*.\n3. Put your Instagram account ID into **Config** (`ig_user_id`).\n4. Test: edit **Test Input**, run *Manual Test*.\n5. **Publish** this workflow: in n8n 2.x, production runs of a caller use the published version (re-publish after edits).\n6. Call it from other workflows with **Execute Sub-workflow** (see README).",
+        "height": 330,
+        "width": 700,
+        "color": 4
+      },
+      "id": "05624beb-ed05-4fba-9d5c-afb549369f46",
+      "name": "Note: Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        -290
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Input (first item only)\nVideo from **one** of: a binary property (`binary_property`, else `video`, `data` or the only one), `video_url` (downloaded by n8n) or `video_path` (inside `allowed_video_dir`, needs `NODE_FUNCTION_ALLOW_BUILTIN=fs`).\n\nOptions: `caption`, `share_to_feed` (default true), `also_story` (default false), `cover_url` **or** `thumb_offset` (ms).",
+        "height": 260,
+        "width": 920,
+        "color": 7
+      },
+      "id": "459f7d87-da15-4849-807e-72b552b233fa",
+      "name": "Note: Input",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Reel: resumable upload\n`POST /{ig-user-id}/media?media_type=REELS&upload_type=resumable` returns `{id, uri}` -> the bytes are POSTed to `uri` (rupload.facebook.com) with headers `offset: 0` and `file_size` -> poll `status_code` every `poll_interval_seconds` (keep it under 65 s so the run never leaves memory) -> `media_publish` -> permalink. ERROR / EXPIRED / timeout stop the run with Meta's status text.",
+        "height": 200,
+        "width": 1560,
+        "color": 5
+      },
+      "id": "beadd8b4-f3af-4410-8457-3b91584d14b1",
+      "name": "Note: Reel",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1520,
+        -30
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Story (optional, never breaks the reel)\nThe Graph API has no \"share reel to story\" option, so the same file is uploaded again as `media_type=STORIES` through the same resumable flow. Every failure here ends in **Story Result** as `story: {ok: false, error}`; the reel result is returned either way.",
+        "height": 160,
+        "width": 1800,
+        "color": 6
+      },
+      "id": "34675575-61a0-4c3d-9876-93aadff0fb59",
+      "name": "Note: Story",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1520,
+        990
+      ]
+    }
+  ],
+  "connections": {
+    "When Called by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Test": {
+      "main": [
+        [
+          {
+            "node": "Test Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Input": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Needs Download?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Download?": {
+      "main": [
+        [
+          {
+            "node": "Download Video",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Video": {
+      "main": [
+        [
+          {
+            "node": "Prepare Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Upload": {
+      "main": [
+        [
+          {
+            "node": "Create Reel Container",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Reel Container": {
+      "main": [
+        [
+          {
+            "node": "Attach Reel Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Reel Video": {
+      "main": [
+        [
+          {
+            "node": "Upload Reel Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Reel Video": {
+      "main": [
+        [
+          {
+            "node": "Wait for Reel Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Reel Processing": {
+      "main": [
+        [
+          {
+            "node": "Get Reel Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Reel Status": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Reel Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Reel Status": {
+      "main": [
+        [
+          {
+            "node": "Reel Status Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reel Status Router": {
+      "main": [
+        [
+          {
+            "node": "Publish Reel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait for Reel Processing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reel Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Reel": {
+      "main": [
+        [
+          {
+            "node": "Get Permalink",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Permalink": {
+      "main": [
+        [
+          {
+            "node": "Reel Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reel Result": {
+      "main": [
+        [
+          {
+            "node": "Also Story?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Also Story?": {
+      "main": [
+        [
+          {
+            "node": "Create Story Container",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Story Container": {
+      "main": [
+        [
+          {
+            "node": "Attach Story Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Story Video": {
+      "main": [
+        [
+          {
+            "node": "Story Container OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Story Container OK?": {
+      "main": [
+        [
+          {
+            "node": "Upload Story Video",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Story Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Story Video": {
+      "main": [
+        [
+          {
+            "node": "Wait for Story Processing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Story Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Story Processing": {
+      "main": [
+        [
+          {
+            "node": "Get Story Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Story Status": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Story Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Story Status": {
+      "main": [
+        [
+          {
+            "node": "Story Status Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Story Status Router": {
+      "main": [
+        [
+          {
+            "node": "Publish Story",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait for Story Processing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Story Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish Story": {
+      "main": [
+        [
+          {
+            "node": "Story Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Story Result": {
+      "main": [
+        [
+          {
+            "node": "Build Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  }
+}
